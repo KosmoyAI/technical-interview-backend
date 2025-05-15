@@ -1,0 +1,54 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydb
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
+
+  valkey:
+    image: valkey/valkey:latest
+    ports:
+      - "6379:6379"
+
+  api:
+    build: .
+    depends_on:
+      - db
+      - valkey
+    environment: &api_environment
+      POSTGRES_USER: myuser
+      POSTGRES_PASSWORD: mypassword
+      POSTGRES_DB: mydb
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      DATABASE_URL: "postgresql+asyncpg://myuser:mypassword@db:5432/mydb"
+
+      VALKEY_HOST: valkey
+      VALKEY_PORT: 6379
+      QUEUE_NAME: ai_queue
+
+      OPENROUTER_API_KEY: "changeme-openrouter-key"
+      OPENROUTER_MODEL: "openai/gpt-4o-mini"
+      OPENROUTER_BASE_URL: "https://openrouter.ai/api/v1"
+      YOUR_SITE_URL: "http://localhost"
+      YOUR_SITE_NAME: "local-dev"
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./src:/app/src
+    command: ["uvicorn","src.main:app","--host","0.0.0.0","--port","8000","--reload"]
+
+  worker:
+    build: .
+    depends_on: [db, valkey]
+    environment:
+      <<: *api_environment
+    command: ["python","-m","src.worker"]
+
+volumes:
+  db_data:
