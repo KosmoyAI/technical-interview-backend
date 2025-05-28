@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import ast
-import json
 import operator as op
-from typing import Iterator, List, TypedDict
+from typing import Iterator, List, TypedDict, Literal
 
 from langchain_openai import ChatOpenAI
 from langgraph.graph import StateGraph, END
@@ -78,51 +77,81 @@ agent_llm = agent_llm.bind_tools([calculate])
 # LangGraph setup
 # ---------------------------------------------------------------------------
 
-graph = StateGraph(AgentState)
-
-
 def agent_node(state: AgentState) -> AgentState:
+    """Main agent node that calls the LLM."""
     response: AIMessage = agent_llm.invoke(state["messages"])
     return {"messages": state["messages"] + [response]}
 
 
-graph.add_node("agent", agent_node)
+def should_continue(state: AgentState) -> Literal["tools", "__end__"]:
+    """Determine whether to continue to tools or end."""
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    # If the LLM makes a tool call, then we route to the "tools" node
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        return "tools"
+    # Otherwise, we stop (reply to the user)
+    return "__end__"
 
 
-def router(state: AgentState) -> str:
-    last = state["messages"][-1]
-    if isinstance(last, AIMessage) and getattr(last, "tool_calls", []):
-        return "calculator"
-    return END
+def tool_node(state: AgentState) -> AgentState:
+    """Execute tool calls and return the results."""
+    messages = state["messages"]
+    last_message = messages[-1]
+    
+    if not isinstance(last_message, AIMessage) or not last_message.tool_calls:
+        raise ValueError("Expected AIMessage with tool_calls")
+    
+    tool_messages = []
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] == "calculate":
+            try:
+                # Extract the expression argument
+                args = tool_call["args"]
+                result = calculate(args["expression"])
+                
+                tool_msg = ToolMessage(
+                    content=result,
+                    tool_call_id=tool_call["id"],
+                )
+            except Exception as e:
+                tool_msg = ToolMessage(
+                    content=f"Error: {str(e)}",
+                    tool_call_id=tool_call["id"],
+                )
+        else:
+            tool_msg = ToolMessage(
+                content=f"Unknown tool: {tool_call['name']}",
+                tool_call_id=tool_call["id"],
+            )
+        
+        tool_messages.append(tool_msg)
+    
+    return {"messages": messages + tool_messages}
 
 
-graph.add_node("router", router)
+# Create the graph
+workflow = StateGraph(AgentState)
 
-graph.add_edge("agent", "router")
+# Add nodes
+workflow.add_node("agent", agent_node)
+workflow.add_node("tools", tool_node)
 
+# Set the entrypoint
+workflow.set_entry_point("agent")
 
-def calculator_node(state: AgentState) -> AgentState:
-    last: AIMessage = state["messages"][-1]
-    call = last.tool_calls[0]
+# Add conditional edges
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+)
 
-    args = json.loads(call["function"]["arguments"] or "{}")
-    result = calculate(**args)  # **args → expression=str
+# Add normal edge from tools back to agent
+workflow.add_edge("tools", "agent")
 
-    tool_msg = ToolMessage(
-        content=result,
-        tool_call_id=call["id"],
-        name=call["function"]["name"],  # not strictly required but useful
-    )
-    return {"messages": state["messages"] + [tool_msg]}
-
-
-graph.add_node("calculator", calculator_node)
-
-graph.add_edge("calculator", "agent")
-
-# Where execution starts
-graph.set_entry_point("agent")
-executor = graph.compile()
+# Compile the workflow
+executor = workflow.compile()
 
 # ---------------------------------------------------------------------------
 # Convenience helpers
@@ -133,15 +162,15 @@ def run_llm(prompt: str) -> str:
     state = executor.invoke({"messages": [HumanMessage(content=prompt)]})
     for msg in reversed(state["messages"]):
         if isinstance(msg, AIMessage):
-            return msg.content
+            return msg.content or ""
     raise RuntimeError("Agent produced no AIMessage")
 
 
 def stream_llm(prompt: str) -> Iterator[str]:
     """Yield partial completions as they stream back from the model."""
-    for update in executor.stream({"messages": [HumanMessage(content=prompt)]}):
-        if "messages" in update:
-            last = update["messages"][-1]
-            if isinstance(last, AIMessage):
-                yield last.content
-
+    for event in executor.stream({"messages": [HumanMessage(content=prompt)]}):
+        for node_name, node_output in event.items():
+            if "messages" in node_output:
+                last = node_output["messages"][-1]
+                if isinstance(last, AIMessage) and last.content:
+                    yield last.content
